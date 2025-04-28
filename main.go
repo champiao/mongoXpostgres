@@ -32,18 +32,41 @@ type Config struct {
 	SkipCollections []string
 }
 
+// Função para sanitizar nomes de tabelas, substituindo caracteres inválidos
+func sanitizeTableName(name string) string {
+	// Substituir pontos por sublinhados
+	name = strings.ReplaceAll(name, ".", "_")
+
+	// Colocar em minúsculas para consistência
+	name = strings.ToLower(name)
+
+	// Substituir outros caracteres que podem causar problemas
+	name = strings.ReplaceAll(name, "-", "_")
+	name = strings.ReplaceAll(name, " ", "_")
+	name = strings.ReplaceAll(name, "/", "_")
+
+	return name
+}
+
 func main() {
 	// Configuração via flags
 	config := Config{}
 	flag.StringVar(&config.DataPath, "path", "", "Caminho para os arquivos BSON/JSON exportados do MongoDB")
 	flag.BoolVar(&config.DropExisting, "drop", false, "Apagar tabelas existentes antes de criar novas")
 	collectionsFlag := flag.String("collections", "", "Lista de collections para migrar, separadas por vírgula (opcional)")
-	skipFlag := flag.String("skip", "", "Lista de collections para pular, separadas por vírgula (opcional)")
+	skipFlag := flag.String("skip", "", "Lista de collections para ignorar, separadas por vírgula (opcional)")
 	envFile := flag.String("env", ".env", "Caminho para o arquivo .env")
+	debugFlag := flag.Bool("debug", false, "Ativar modo de depuração com mais informações")
+	batchSizeFlag := flag.Int("batch", 100, "Tamanho do lote para inserções em massa (padrão: 100)")
 	flag.Parse()
 
 	if config.DataPath == "" {
 		log.Fatal("Erro: O caminho para os arquivos exportados do MongoDB é obrigatório. Use a flag -path")
+	}
+
+	// Definir o nível de log com base na flag de depuração
+	if *debugFlag {
+		log.Println("Modo de depuração ativado - exibindo informações detalhadas")
 	}
 
 	// Processar listas de collections
@@ -166,15 +189,18 @@ func main() {
 		// Remove a extensão para obter o nome da collection
 		collectionName := strings.TrimSuffix(fileName, filepath.Ext(fileName))
 		filePath := filepath.Join(config.DataPath, fileName)
-		sanitizedTableName := strings.ToLower(collectionName)
+
+		// Sanitizar o nome da tabela para PostgreSQL
+		sanitizedTableName := sanitizeTableName(collectionName)
+
+		fmt.Printf("\n--- Processando Collection: %s → Tabela: %s (Arquivo: %s) ---\n",
+			collectionName, sanitizedTableName, fileName)
 
 		// Verificar se deve pular esta collection
 		if shouldSkip(collectionName, config.OnlyCollections, config.SkipCollections) {
 			fmt.Printf("Pulando collection: %s (filtrada por configuração)\n", collectionName)
 			continue
 		}
-
-		fmt.Printf("\n--- Processando Collection: %s (Arquivo: %s) ---\n", collectionName, fileName)
 
 		// Verificar se a tabela já existe
 		var tableExists bool
@@ -243,9 +269,8 @@ func main() {
 		}
 		fmt.Println("Tabela criada com sucesso!")
 
-		// Migrar dados para PostgreSQL
-		fmt.Printf("Iniciando migração de %d documentos para a tabela '%s'...\n", len(docs), sanitizedTableName)
-		err = migrateData(ctx, conn, sanitizedTableName, inferredSchema, docs)
+		// Na parte onde chamamos migrateData, modificar para:
+		err = migrateData(ctx, conn, sanitizedTableName, inferredSchema, docs, *batchSizeFlag)
 		if err != nil {
 			log.Printf("ERRO durante a migração de dados para %s: %v", sanitizedTableName, err)
 		} else {
@@ -600,7 +625,7 @@ func generateCreateTableSQL(tableName string, schema map[string]string) string {
 }
 
 // migrateData insere documentos BSON em uma tabela PostgreSQL existente.
-func migrateData(ctx context.Context, conn *pgx.Conn, tableName string, schema map[string]string, docs []bson.M) error {
+func migrateData(ctx context.Context, conn *pgx.Conn, tableName string, schema map[string]string, docs []bson.M, batchSize int) error {
 	fmt.Printf("Iniciando migração para tabela %s (%d documentos)...\n", tableName, len(docs))
 
 	// Verificar schema atual da tabela para garantir compatibilidade
@@ -668,177 +693,396 @@ func migrateData(ctx context.Context, conn *pgx.Conn, tableName string, schema m
 	insertSQL := sqlBuilder.String()
 	fmt.Printf("SQL de inserção: %s\n", insertSQL) // Log para debug
 
-	// Inserir documentos um por um (para simplificar, idealmente usar batch/copy)
-	// TODO: Investigar pgx.CopyFrom para melhor performance
+	// Verificar se a tabela metadata tem apenas um documento
+	isMetadataTable := strings.Contains(tableName, "_metadata")
+	if isMetadataTable && len(docs) == 1 {
+		fmt.Println("Tabela de metadados detectada. Inserindo documento único...")
+	}
+
+	// Configuração do tamanho do lote
+	// Se for uma collection pequena, fazer inserção um por um
+	if len(docs) <= 10 {
+		batchSize = 1
+	}
+
+	fmt.Printf("Usando tamanho de lote: %d para %d documentos\n", batchSize, len(docs))
+
+	// Contadores e estatísticas
 	insertedCount := 0
 	errorCount := 0
+	batchCount := 0
+	startTime := time.Now()
 
-	for i, doc := range docs {
-		// Log de progresso para documentos maiores
-		if len(docs) > 1000 && i%500 == 0 {
-			fmt.Printf("  Processando documento %d/%d...\n", i, len(docs))
+	// Processar documentos em lotes
+	for i := 0; i < len(docs); i += batchSize {
+		batchCount++
+		end := i + batchSize
+		if end > len(docs) {
+			end = len(docs)
 		}
 
-		// Modificação: se _id existe, copiar para mongo_id
-		if id, hasID := doc["_id"]; hasID {
-			switch v := id.(type) {
-			case primitive.ObjectID:
-				doc["mongo_id"] = v.Hex()
-			default:
-				// Para outros tipos, converter para string
-				doc["mongo_id"] = fmt.Sprintf("%v", v)
+		processingBatch := docs[i:end]
+		batchStartTime := time.Now()
+		fmt.Printf("  Lote #%d: Processando documentos %d-%d de %d...\n", batchCount, i+1, end, len(docs))
+
+		// Iniciar uma transação para o lote inteiro
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			log.Printf("ERRO ao iniciar transação para lote #%d: %v", batchCount, err)
+			errorCount += len(processingBatch)
+			continue
+		}
+
+		batchSuccessCount := 0
+		batchErrors := 0
+
+		// Processar cada documento no lote
+		for docIndex, doc := range processingBatch {
+			// Modificação: se _id existe, copiar para mongo_id
+			if id, hasID := doc["_id"]; hasID {
+				switch v := id.(type) {
+				case primitive.ObjectID:
+					doc["mongo_id"] = v.Hex()
+				default:
+					// Para outros tipos, converter para string
+					doc["mongo_id"] = fmt.Sprintf("%v", v)
+				}
 			}
-		}
 
-		values := make([]interface{}, 0, len(columns))
-		for _, colName := range columns {
-			var rawValue interface{}
-			var exists bool
+			values := make([]interface{}, 0, len(columns))
+			for _, colName := range columns {
+				var rawValue interface{}
+				var exists bool
 
-			// Caso especial para mongo_id que pode vir do _id
-			if colName == "mongo_id" {
-				rawValue, exists = doc["mongo_id"]
-				if !exists {
-					if id, hasID := doc["_id"]; hasID {
-						switch v := id.(type) {
-						case primitive.ObjectID:
-							rawValue = v.Hex()
-							exists = true
-						default:
-							rawValue = fmt.Sprintf("%v", v)
-							exists = true
+				// Caso especial para mongo_id que pode vir do _id
+				if colName == "mongo_id" {
+					rawValue, exists = doc["mongo_id"]
+					if !exists {
+						if id, hasID := doc["_id"]; hasID {
+							switch v := id.(type) {
+							case primitive.ObjectID:
+								rawValue = v.Hex()
+								exists = true
+							default:
+								rawValue = fmt.Sprintf("%v", v)
+								exists = true
+							}
 						}
 					}
+				} else {
+					rawValue, exists = doc[colName]
+				}
+
+				if !exists || rawValue == nil {
+					values = append(values, nil) // Mapeia campo ausente ou nulo para NULL
+					continue
+				}
+
+				// Conversão de tipos BSON para SQL
+				var sqlValue interface{}
+				sqlType := schema[colName]
+
+				// Verificar compatibilidade de tipos
+				if sqlType == "BIGINT" || sqlType == "INTEGER" {
+					// Convertemos timestamps para números se necessário
+					switch v := rawValue.(type) {
+					case primitive.DateTime:
+						// Converter para int64 se for para coluna numérica
+						sqlValue = int64(v)
+					case time.Time:
+						// Converter para Unix timestamp se for para coluna numérica
+						sqlValue = v.Unix()
+					default:
+						// Usar o valor como está se for numérico
+						sqlValue = v
+					}
+					values = append(values, sqlValue)
+					continue
+				}
+
+				if sqlType == "TIMESTAMPTZ" {
+					// Garantir que temos timestamp para colunas de data
+					switch v := rawValue.(type) {
+					case primitive.DateTime:
+						sqlValue = v.Time()
+					case int64:
+						// Converter int64 para timestamp se necessário
+						sqlValue = time.Unix(0, v*int64(time.Millisecond))
+					case time.Time:
+						sqlValue = v
+					default:
+						// Não conseguimos converter para timestamp
+						log.Printf("Aviso: Valor incompatível %T para coluna TIMESTAMPTZ %s. Inserindo NULL.",
+							v, colName)
+						sqlValue = nil
+					}
+					values = append(values, sqlValue)
+					continue
+				}
+
+				// Tratamento padrão para outros tipos
+				switch specificVal := rawValue.(type) {
+				case primitive.ObjectID:
+					sqlValue = specificVal.Hex()
+				case primitive.DateTime:
+					sqlValue = specificVal.Time()
+				case time.Time: // Já é time.Time
+					sqlValue = specificVal
+				case primitive.Decimal128:
+					// Convertendo para string por segurança
+					sqlValue = specificVal.String()
+				case primitive.Binary:
+					sqlValue = specificVal.Data
+				case map[string]interface{}, []interface{}: // Para JSONB
+					if sqlType == "JSONB" {
+						jsonBytes, err := json.Marshal(specificVal)
+						if err != nil {
+							log.Printf("Erro ao converter para JSON. Inserindo NULL.")
+							sqlValue = nil
+						} else {
+							sqlValue = string(jsonBytes) // Convertendo para string para JSONB
+						}
+					} else {
+						log.Printf("Aviso: Tipo map/slice inesperado para coluna %s (tipo %s). Convertendo para JSONB.", colName, sqlType)
+						jsonBytes, err := json.Marshal(specificVal)
+						if err != nil {
+							sqlValue = nil
+						} else {
+							sqlValue = string(jsonBytes)
+						}
+					}
+				default:
+					sqlValue = specificVal // Tipos básicos (string, int, float, bool) devem funcionar
+				}
+				values = append(values, sqlValue)
+			}
+
+			// Executar o INSERT dentro da transação
+			_, err := tx.Exec(ctx, insertSQL, values...)
+			if err != nil {
+				batchErrors++
+
+				// Se estamos no modo de depuração ou este é um dos primeiros erros, mostrar detalhes
+				if batchErrors <= 3 || batchErrors == len(docs)/10 {
+					log.Printf("ERRO ao inserir documento #%d (global #%d) na tabela %s: %v",
+						docIndex, i+docIndex+1, tableName, err)
+
+					// Mostrar os primeiros valores para depuração
+					debugValues := "["
+					for j, v := range values {
+						if j < 5 {
+							if v == nil {
+								debugValues += "NULL, "
+							} else {
+								debugValues += fmt.Sprintf("%T(%v), ", v, v)
+							}
+						} else {
+							debugValues += "..."
+							break
+						}
+					}
+					debugValues += "]"
+					log.Printf("  Valores (parcial): %s", debugValues)
 				}
 			} else {
-				rawValue, exists = doc[colName]
+				batchSuccessCount++
 			}
-
-			if !exists || rawValue == nil {
-				values = append(values, nil) // Mapeia campo ausente ou nulo para NULL
-				continue
-			}
-
-			// Conversão de tipos BSON para SQL
-			var sqlValue interface{}
-			sqlType := schema[colName]
-
-			// Verificar compatibilidade de tipos
-			if sqlType == "BIGINT" || sqlType == "INTEGER" {
-				// Convertemos timestamps para números se necessário
-				switch v := rawValue.(type) {
-				case primitive.DateTime:
-					// Converter para int64 se for para coluna numérica
-					sqlValue = int64(v)
-				case time.Time:
-					// Converter para Unix timestamp se for para coluna numérica
-					sqlValue = v.Unix()
-				default:
-					// Usar o valor como está se for numérico
-					sqlValue = v
-				}
-				values = append(values, sqlValue)
-				continue
-			}
-
-			if sqlType == "TIMESTAMPTZ" {
-				// Garantir que temos timestamp para colunas de data
-				switch v := rawValue.(type) {
-				case primitive.DateTime:
-					sqlValue = v.Time()
-				case int64:
-					// Converter int64 para timestamp se necessário
-					sqlValue = time.Unix(0, v*int64(time.Millisecond))
-				case time.Time:
-					sqlValue = v
-				default:
-					// Não conseguimos converter para timestamp
-					log.Printf("Aviso: Valor incompatível %T para coluna TIMESTAMPTZ %s no documento %d",
-						v, colName, i)
-					sqlValue = nil
-				}
-				values = append(values, sqlValue)
-				continue
-			}
-
-			// Tratamento padrão para outros tipos
-			switch specificVal := rawValue.(type) {
-			case primitive.ObjectID:
-				sqlValue = specificVal.Hex()
-			case primitive.DateTime:
-				sqlValue = specificVal.Time()
-			case time.Time: // Já é time.Time
-				sqlValue = specificVal
-			case primitive.Decimal128:
-				// Convertendo para string por segurança
-				sqlValue = specificVal.String()
-			case primitive.Binary:
-				sqlValue = specificVal.Data
-			case map[string]interface{}, []interface{}: // Para JSONB
-				if sqlType == "JSONB" {
-					jsonBytes, err := json.Marshal(specificVal)
-					if err != nil {
-						log.Printf("Erro ao converter %s para JSON no doc %d: %v. Inserindo NULL.", colName, i, err)
-						sqlValue = nil
-					} else {
-						sqlValue = string(jsonBytes) // Modificado: convertendo para string para JSONB
-					}
-				} else {
-					log.Printf("Aviso: Tipo map/slice inesperado para coluna %s (tipo %s) no doc %d. Convertendo para JSONB.", colName, sqlType, i)
-					jsonBytes, err := json.Marshal(specificVal)
-					if err != nil {
-						sqlValue = nil
-					} else {
-						sqlValue = string(jsonBytes)
-					}
-				}
-			default:
-				sqlValue = specificVal // Tipos básicos (string, int, float, bool) devem funcionar
-			}
-			values = append(values, sqlValue)
 		}
 
-		// Executar o INSERT
-		_, err := conn.Exec(ctx, insertSQL, values...)
-		if err != nil {
-			errorCount++
-			log.Printf("ERRO ao inserir documento %d na tabela %s: %v", i, tableName, err)
+		// Finalizar a transação
+		if batchErrors == 0 {
+			// Nenhum erro, commit da transação
+			if err := tx.Commit(ctx); err != nil {
+				log.Printf("ERRO ao fazer commit da transação para lote #%d: %v", batchCount, err)
+				errorCount += len(processingBatch)
+			} else {
+				insertedCount += batchSuccessCount
 
-			// Mostrar os primeiros valores (limitado a 5) para debug
-			debugValues := "["
-			for j, v := range values {
-				if j < 5 {
-					if v == nil {
-						debugValues += "NULL, "
-					} else {
-						debugValues += fmt.Sprintf("%T(%v), ", v, v)
-					}
-				} else {
-					debugValues += "..."
-					break
-				}
-			}
-			debugValues += "]"
-			log.Printf("  Valores (parcial): %s", debugValues)
+				// Calcular e exibir estatísticas deste lote
+				batchDuration := time.Since(batchStartTime)
+				docsPerSecond := float64(batchSuccessCount) / batchDuration.Seconds()
 
-			// Limitar o número de erros para não inundar o console
-			if errorCount >= 10 && errorCount == len(docs)/10 {
-				log.Printf("Muitos erros de inserção, reduzindo logging...")
-			} else if errorCount > 10 && errorCount != len(docs) {
-				// Não mostrar todos os erros
-				continue
+				fmt.Printf("  Lote #%d: Inseridos %d documentos em %.2f segundos (%.2f docs/seg)\n",
+					batchCount, batchSuccessCount, batchDuration.Seconds(), docsPerSecond)
 			}
 		} else {
-			insertedCount++
+			// Houve erros, rollback da transação
+			tx.Rollback(ctx)
+			log.Printf("Lote #%d: Rollback da transação devido a %d erros.", batchCount, batchErrors)
+			errorCount += batchErrors
+
+			// Se o tamanho do lote é grande e estamos tendo muitos erros,
+			// tentar reduzir o tamanho do lote para as próximas iterações
+			if batchSize > 10 && batchErrors > batchSize/2 {
+				newBatchSize := batchSize / 2
+				log.Printf("Reduzindo tamanho do lote de %d para %d devido a muitos erros", batchSize, newBatchSize)
+				batchSize = newBatchSize
+			}
+
+			// Se o lote for grande e falhar completamente, tentar inserir documento por documento
+			if batchSize > 1 && batchSuccessCount == 0 {
+				log.Printf("Tentando inserção documento por documento para o lote #%d...", batchCount)
+
+				// Tentar inserir cada documento individualmente fora da transação
+				for _, docToInsert := range processingBatch {
+					// Copiar o mesmo processo de preparação usado acima
+					if id, hasID := docToInsert["_id"]; hasID {
+						switch v := id.(type) {
+						case primitive.ObjectID:
+							docToInsert["mongo_id"] = v.Hex()
+						default:
+							docToInsert["mongo_id"] = fmt.Sprintf("%v", v)
+						}
+					}
+
+					individualValues := make([]interface{}, 0, len(columns))
+					for _, colName := range columns {
+						var rawValue interface{}
+						var exists bool
+
+						if colName == "mongo_id" {
+							rawValue, exists = docToInsert["mongo_id"]
+							if !exists {
+								if id, hasID := docToInsert["_id"]; hasID {
+									switch v := id.(type) {
+									case primitive.ObjectID:
+										rawValue = v.Hex()
+										exists = true
+									default:
+										rawValue = fmt.Sprintf("%v", v)
+										exists = true
+									}
+								}
+							}
+						} else {
+							rawValue, exists = docToInsert[colName]
+						}
+
+						if !exists || rawValue == nil {
+							individualValues = append(individualValues, nil)
+							continue
+						}
+
+						// Conversão de tipos como acima
+						var sqlValue interface{}
+						sqlType := schema[colName]
+
+						// Verificar compatibilidade de tipos
+						if sqlType == "BIGINT" || sqlType == "INTEGER" {
+							switch v := rawValue.(type) {
+							case primitive.DateTime:
+								sqlValue = int64(v)
+							case time.Time:
+								sqlValue = v.Unix()
+							default:
+								sqlValue = v
+							}
+							individualValues = append(individualValues, sqlValue)
+							continue
+						}
+
+						if sqlType == "TIMESTAMPTZ" {
+							switch v := rawValue.(type) {
+							case primitive.DateTime:
+								sqlValue = v.Time()
+							case int64:
+								sqlValue = time.Unix(0, v*int64(time.Millisecond))
+							case time.Time:
+								sqlValue = v
+							default:
+								sqlValue = nil
+							}
+							individualValues = append(individualValues, sqlValue)
+							continue
+						}
+
+						// Tratamento padrão
+						switch specificVal := rawValue.(type) {
+						case primitive.ObjectID:
+							sqlValue = specificVal.Hex()
+						case primitive.DateTime:
+							sqlValue = specificVal.Time()
+						case time.Time:
+							sqlValue = specificVal
+						case primitive.Decimal128:
+							sqlValue = specificVal.String()
+						case primitive.Binary:
+							sqlValue = specificVal.Data
+						case map[string]interface{}, []interface{}:
+							if sqlType == "JSONB" {
+								jsonBytes, err := json.Marshal(specificVal)
+								if err != nil {
+									sqlValue = nil
+								} else {
+									sqlValue = string(jsonBytes)
+								}
+							} else {
+								jsonBytes, err := json.Marshal(specificVal)
+								if err != nil {
+									sqlValue = nil
+								} else {
+									sqlValue = string(jsonBytes)
+								}
+							}
+						default:
+							sqlValue = specificVal
+						}
+						individualValues = append(individualValues, sqlValue)
+					}
+
+					// Tentar inserção individual
+					_, err := conn.Exec(ctx, insertSQL, individualValues...)
+					if err == nil {
+						insertedCount++
+					}
+				}
+			}
 		}
 
-		// Log de progresso (opcional)
-		if insertedCount > 0 && insertedCount%1000 == 0 {
-			fmt.Printf("  ... %d / %d documentos inseridos em %s ...\n", insertedCount, len(docs), tableName)
+		// Mostrar progresso geral
+		percentComplete := float64(i+len(processingBatch)) / float64(len(docs)) * 100
+		elapsedTime := time.Since(startTime)
+		estimatedTotal := elapsedTime.Seconds() / (float64(i+len(processingBatch)) / float64(len(docs)))
+		remainingTime := estimatedTotal - elapsedTime.Seconds()
+
+		fmt.Printf("  Progresso: %.1f%% (%d/%d) | Tempo estimado restante: %.1f segundos\n",
+			percentComplete, i+len(processingBatch), len(docs), remainingTime)
+	}
+
+	// Se não houve nenhuma inserção e temos registros, tentar fazer um Insert mínimo para metadados
+	if insertedCount == 0 && len(docs) > 0 && isMetadataTable {
+		log.Printf("Tentando inserção simplificada para tabela de metadados %s", tableName)
+
+		// Para metadados, tentar inserir apenas o _id como fallback
+		if id, hasID := docs[0]["_id"]; hasID {
+			var idStr string
+			switch v := id.(type) {
+			case primitive.ObjectID:
+				idStr = v.Hex()
+			default:
+				idStr = fmt.Sprintf("%v", v)
+			}
+
+			_, err := conn.Exec(ctx, fmt.Sprintf(`INSERT INTO public."%s" (mongo_id) VALUES ($1)`, tableName), idStr)
+			if err == nil {
+				insertedCount = 1
+				log.Printf("Inserção simplificada bem-sucedida para %s", tableName)
+			} else {
+				log.Printf("Falha na inserção simplificada: %v", err)
+			}
 		}
 	}
 
-	fmt.Printf("  %d / %d documentos inseridos com sucesso em %s.\n", insertedCount, len(docs), tableName)
+	// Mostrar estatísticas finais
+	totalTime := time.Since(startTime)
+	avgDocsPerSecond := float64(insertedCount) / totalTime.Seconds()
+
+	fmt.Printf("\nMigração concluída para %s:\n", tableName)
+	fmt.Printf("  Duração total: %.2f segundos\n", totalTime.Seconds())
+	fmt.Printf("  Documentos inseridos: %d / %d (%.1f%%)\n",
+		insertedCount, len(docs), float64(insertedCount)/float64(len(docs))*100)
+	fmt.Printf("  Taxa média: %.2f documentos/segundo\n", avgDocsPerSecond)
+
 	if insertedCount != len(docs) {
 		log.Printf("Aviso: %d erros ocorreram durante a inserção na tabela %s.", len(docs)-insertedCount, tableName)
 		if errorCount > 0 {
