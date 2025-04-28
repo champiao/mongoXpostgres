@@ -394,12 +394,20 @@ func inferSchema(docs []bson.M) map[string]string {
 	// fieldTypes armazena a contagem de cada tipo Go visto para cada nome de campo
 	// Ex: fieldTypes["age"][reflect.TypeOf(int32(0))] = 10
 	fieldTypes := make(map[string]map[reflect.Type]int)
+	// Para debugging e melhor inferência
+	fieldExamples := make(map[string]interface{})
 
 	for _, doc := range docs {
 		for key, value := range doc {
 			if fieldTypes[key] == nil {
 				fieldTypes[key] = make(map[reflect.Type]int)
 			}
+
+			// Guardar um exemplo não-nulo do valor para melhor inferência
+			if value != nil && fieldExamples[key] == nil {
+				fieldExamples[key] = value
+			}
+
 			// Usar reflect.TypeOf(nil) se o valor for nil explicitamente
 			var valueType reflect.Type
 			if value == nil {
@@ -424,7 +432,15 @@ func inferSchema(docs []bson.M) map[string]string {
 		hasNil := false
 		multipleTypes := len(typeCounts) > 1
 
+		// Mostrar todos os tipos encontrados para este campo (para debugging)
+		typeNames := make([]string, 0, len(typeCounts))
 		for typ, count := range typeCounts {
+			typeName := "nil"
+			if typ != reflect.TypeOf((*interface{})(nil)).Elem() {
+				typeName = typ.String()
+			}
+			typeNames = append(typeNames, fmt.Sprintf("%s:%d", typeName, count))
+
 			if typ == reflect.TypeOf((*interface{})(nil)).Elem() {
 				hasNil = true
 				// Não consideramos nil como dominante, mas anotamos sua presença
@@ -436,12 +452,27 @@ func inferSchema(docs []bson.M) map[string]string {
 			}
 		}
 
+		// Imprimir tipos para diagnóstico em caso de múltiplos tipos
+		if multipleTypes && len(typeNames) > 1 {
+			log.Printf("Campo '%s' tem múltiplos tipos: %v", fieldName, strings.Join(typeNames, ", "))
+		}
+
 		// Se só vimos nil, ou não vimos nenhum tipo (campo sempre nil?)
 		if dominantType == nil {
 			// Vamos assumir TEXT como um palpite seguro se só vimos nulos.
 			// Ou poderíamos omitir a coluna, mas TEXT é mais flexível.
 			inferredSQLSchema[fieldName] = "TEXT" // Ou talvez JSONB? Ou omitir?
 			log.Printf("Aviso: Campo '%s' parece ser sempre nulo ou ausente. Mapeando para TEXT.", fieldName)
+			continue
+		}
+
+		// Caso especial: timestamps e dates do MongoDB
+		example := fieldExamples[fieldName]
+		switch example.(type) {
+		case primitive.DateTime, time.Time:
+			// Sempre mapear datas para TIMESTAMPTZ independentemente da prevalência
+			inferredSQLSchema[fieldName] = "TIMESTAMPTZ"
+			log.Printf("Campo '%s' contém timestamp. Forçando tipo TIMESTAMPTZ.", fieldName)
 			continue
 		}
 
@@ -455,13 +486,30 @@ func inferSchema(docs []bson.M) map[string]string {
 				log.Printf("Info: Campo '%s' tem tipos int32 e int64. Promovendo para BIGINT.", fieldName)
 			} else {
 				inferredSQLSchema[fieldName] = "JSONB"
-				log.Printf("Aviso: Campo '%s' tem múltiplos tipos (%v). Mapeando para JSONB.", fieldName, typeCounts)
+				log.Printf("Aviso: Campo '%s' tem múltiplos tipos. Mapeando para JSONB.", fieldName)
 			}
 		} else {
 			// Mapear o tipo dominante para SQL
 			inferredSQLSchema[fieldName] = mapGoTypeToSQL(dominantType)
 		}
 	}
+
+	// Log do schema completo para cada tabela
+	var schemaDesc strings.Builder
+	schemaDesc.WriteString("Schema inferido:\n")
+
+	fields := make([]string, 0, len(inferredSQLSchema))
+	for fieldName := range inferredSQLSchema {
+		fields = append(fields, fieldName)
+	}
+	sort.Strings(fields)
+
+	for _, field := range fields {
+		sqlType := inferredSQLSchema[field]
+		schemaDesc.WriteString(fmt.Sprintf("  - %s: %s\n", field, sqlType))
+	}
+
+	log.Print(schemaDesc.String())
 
 	return inferredSQLSchema
 }
@@ -555,6 +603,34 @@ func generateCreateTableSQL(tableName string, schema map[string]string) string {
 func migrateData(ctx context.Context, conn *pgx.Conn, tableName string, schema map[string]string, docs []bson.M) error {
 	fmt.Printf("Iniciando migração para tabela %s (%d documentos)...\n", tableName, len(docs))
 
+	// Verificar schema atual da tabela para garantir compatibilidade
+	rows, err := conn.Query(ctx, `
+		SELECT column_name, data_type, udt_name
+		FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = $1
+	`, tableName)
+	if err != nil {
+		log.Printf("Erro ao consultar schema da tabela %s: %v", tableName, err)
+	} else {
+		defer rows.Close()
+
+		pgSchema := make(map[string]string)
+		for rows.Next() {
+			var columnName, dataType, udtName string
+			if err := rows.Scan(&columnName, &dataType, &udtName); err != nil {
+				log.Printf("Erro ao ler schema: %v", err)
+				continue
+			}
+			pgSchema[columnName] = dataType
+		}
+
+		// Log para comparar schema inferido vs. real
+		log.Printf("Schema real da tabela %s no PostgreSQL:", tableName)
+		for col, typ := range pgSchema {
+			log.Printf("  - %s: %s", col, typ)
+		}
+	}
+
 	// Preparar lista de colunas para o INSERT (incluindo mongo_id, excluindo id, created_at, updated_at que têm defaults)
 	// Ordenar para garantir consistência entre a query e os valores
 	columns := make([]string, 0, len(schema))
@@ -647,6 +723,45 @@ func migrateData(ctx context.Context, conn *pgx.Conn, tableName string, schema m
 			var sqlValue interface{}
 			sqlType := schema[colName]
 
+			// Verificar compatibilidade de tipos
+			if sqlType == "BIGINT" || sqlType == "INTEGER" {
+				// Convertemos timestamps para números se necessário
+				switch v := rawValue.(type) {
+				case primitive.DateTime:
+					// Converter para int64 se for para coluna numérica
+					sqlValue = int64(v)
+				case time.Time:
+					// Converter para Unix timestamp se for para coluna numérica
+					sqlValue = v.Unix()
+				default:
+					// Usar o valor como está se for numérico
+					sqlValue = v
+				}
+				values = append(values, sqlValue)
+				continue
+			}
+
+			if sqlType == "TIMESTAMPTZ" {
+				// Garantir que temos timestamp para colunas de data
+				switch v := rawValue.(type) {
+				case primitive.DateTime:
+					sqlValue = v.Time()
+				case int64:
+					// Converter int64 para timestamp se necessário
+					sqlValue = time.Unix(0, v*int64(time.Millisecond))
+				case time.Time:
+					sqlValue = v
+				default:
+					// Não conseguimos converter para timestamp
+					log.Printf("Aviso: Valor incompatível %T para coluna TIMESTAMPTZ %s no documento %d",
+						v, colName, i)
+					sqlValue = nil
+				}
+				values = append(values, sqlValue)
+				continue
+			}
+
+			// Tratamento padrão para outros tipos
 			switch specificVal := rawValue.(type) {
 			case primitive.ObjectID:
 				sqlValue = specificVal.Hex()
