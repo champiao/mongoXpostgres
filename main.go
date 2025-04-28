@@ -520,7 +520,7 @@ func generateCreateTableSQL(tableName string, schema map[string]string) string {
 	sanitizedTableName := fmt.Sprintf(`"%s"`, strings.ToLower(tableName))
 
 	sqlBuilder.WriteString(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS public.%s (`, sanitizedTableName))
-	sqlBuilder.WriteString(`\n    id UUID PRIMARY KEY DEFAULT uuid_generate_v4()`)
+	sqlBuilder.WriteString("\n    id UUID PRIMARY KEY DEFAULT uuid_generate_v4()")
 
 	// Adicionar colunas do schema inferido (ordenadas por nome)
 	fields := make([]string, 0, len(schema))
@@ -533,15 +533,15 @@ func generateCreateTableSQL(tableName string, schema map[string]string) string {
 		sqlType := schema[fieldName]
 		// Sanitizar nome da coluna (colocar entre aspas)
 		sanitizedFieldName := fmt.Sprintf(`"%s"`, fieldName)
-		sqlBuilder.WriteString(fmt.Sprintf(`,\n    %s %s`, sanitizedFieldName, sqlType))
+		sqlBuilder.WriteString(fmt.Sprintf(",\n    %s %s", sanitizedFieldName, sqlType))
 		// Por enquanto, todas as colunas inferidas são NULLABLE
 	}
 
 	// Adicionar colunas padrão de timestamp
-	sqlBuilder.WriteString(`,\n    created_at TIMESTAMPTZ DEFAULT now()`) // Adicionado
-	sqlBuilder.WriteString(`,\n    updated_at TIMESTAMPTZ DEFAULT now()`) // Adicionado
+	sqlBuilder.WriteString(",\n    created_at TIMESTAMPTZ DEFAULT now()") // Adicionado
+	sqlBuilder.WriteString(",\n    updated_at TIMESTAMPTZ DEFAULT now()") // Adicionado
 
-	sqlBuilder.WriteString(`\n);`)
+	sqlBuilder.WriteString("\n);")
 
 	return sqlBuilder.String()
 }
