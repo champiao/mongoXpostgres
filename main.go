@@ -513,14 +513,14 @@ func mapGoTypeToSQL(t reflect.Type) string {
 
 // generateCreateTableSQL gera uma string SQL CREATE TABLE para PostgreSQL.
 func generateCreateTableSQL(tableName string, schema map[string]string) string {
-	// Usar strings.Builder para construção eficiente
-	var sqlBuilder strings.Builder
-
 	// Sanitizar nome da tabela (simplesmente colocar entre aspas por enquanto)
 	sanitizedTableName := fmt.Sprintf(`"%s"`, strings.ToLower(tableName))
 
-	sqlBuilder.WriteString(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS public.%s (`, sanitizedTableName))
-	sqlBuilder.WriteString("\n    id UUID PRIMARY KEY DEFAULT uuid_generate_v4()")
+	// Construir o SQL usando slice de strings e join, evitando caracteres de escape
+	sqlParts := []string{
+		fmt.Sprintf("CREATE TABLE IF NOT EXISTS public.%s (", sanitizedTableName),
+		"    id UUID PRIMARY KEY DEFAULT uuid_generate_v4()",
+	}
 
 	// Adicionar colunas do schema inferido (ordenadas por nome)
 	fields := make([]string, 0, len(schema))
@@ -533,17 +533,22 @@ func generateCreateTableSQL(tableName string, schema map[string]string) string {
 		sqlType := schema[fieldName]
 		// Sanitizar nome da coluna (colocar entre aspas)
 		sanitizedFieldName := fmt.Sprintf(`"%s"`, fieldName)
-		sqlBuilder.WriteString(fmt.Sprintf(",\n    %s %s", sanitizedFieldName, sqlType))
-		// Por enquanto, todas as colunas inferidas são NULLABLE
+		sqlParts = append(sqlParts, fmt.Sprintf("    %s %s", sanitizedFieldName, sqlType))
 	}
 
 	// Adicionar colunas padrão de timestamp
-	sqlBuilder.WriteString(",\n    created_at TIMESTAMPTZ DEFAULT now()") // Adicionado
-	sqlBuilder.WriteString(",\n    updated_at TIMESTAMPTZ DEFAULT now()") // Adicionado
+	sqlParts = append(sqlParts, "    created_at TIMESTAMPTZ DEFAULT now()")
+	sqlParts = append(sqlParts, "    updated_at TIMESTAMPTZ DEFAULT now()")
+	sqlParts = append(sqlParts, ");")
 
-	sqlBuilder.WriteString("\n);")
+	// Unir todas as partes com vírgulas e quebras de linha apropriadas
+	sql := sqlParts[0] + "\n" + sqlParts[1]
+	for i := 2; i < len(sqlParts)-1; i++ {
+		sql += ",\n" + sqlParts[i]
+	}
+	sql += "\n" + sqlParts[len(sqlParts)-1]
 
-	return sqlBuilder.String()
+	return sql
 }
 
 // migrateData insere documentos BSON em uma tabela PostgreSQL existente.
