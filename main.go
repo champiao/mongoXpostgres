@@ -553,6 +553,8 @@ func generateCreateTableSQL(tableName string, schema map[string]string) string {
 
 // migrateData insere documentos BSON em uma tabela PostgreSQL existente.
 func migrateData(ctx context.Context, conn *pgx.Conn, tableName string, schema map[string]string, docs []bson.M) error {
+	fmt.Printf("Iniciando migração para tabela %s (%d documentos)...\n", tableName, len(docs))
+
 	// Preparar lista de colunas para o INSERT (incluindo mongo_id, excluindo id, created_at, updated_at que têm defaults)
 	// Ordenar para garantir consistência entre a query e os valores
 	columns := make([]string, 0, len(schema))
@@ -560,6 +562,14 @@ func migrateData(ctx context.Context, conn *pgx.Conn, tableName string, schema m
 		columns = append(columns, colName)
 	}
 	sort.Strings(columns)
+
+	if len(columns) == 0 {
+		log.Printf("AVISO: Nenhuma coluna encontrada para migrar na tabela %s", tableName)
+		return fmt.Errorf("nenhuma coluna para migrar")
+	}
+
+	// Debug: mostrar as colunas que serão migradas
+	fmt.Printf("Colunas a serem migradas: %v\n", columns)
 
 	// Construir a parte inicial do INSERT statement
 	var sqlBuilder strings.Builder
@@ -580,15 +590,54 @@ func migrateData(ctx context.Context, conn *pgx.Conn, tableName string, schema m
 	sqlBuilder.WriteString(")")
 
 	insertSQL := sqlBuilder.String()
-	// log.Println("DEBUG: INSERT SQL:", insertSQL) // Descomentar para depurar
+	fmt.Printf("SQL de inserção: %s\n", insertSQL) // Log para debug
 
 	// Inserir documentos um por um (para simplificar, idealmente usar batch/copy)
 	// TODO: Investigar pgx.CopyFrom para melhor performance
 	insertedCount := 0
+	errorCount := 0
+
 	for i, doc := range docs {
+		// Log de progresso para documentos maiores
+		if len(docs) > 1000 && i%500 == 0 {
+			fmt.Printf("  Processando documento %d/%d...\n", i, len(docs))
+		}
+
+		// Modificação: se _id existe, copiar para mongo_id
+		if id, hasID := doc["_id"]; hasID {
+			switch v := id.(type) {
+			case primitive.ObjectID:
+				doc["mongo_id"] = v.Hex()
+			default:
+				// Para outros tipos, converter para string
+				doc["mongo_id"] = fmt.Sprintf("%v", v)
+			}
+		}
+
 		values := make([]interface{}, 0, len(columns))
 		for _, colName := range columns {
-			rawValue, exists := doc[colName]
+			var rawValue interface{}
+			var exists bool
+
+			// Caso especial para mongo_id que pode vir do _id
+			if colName == "mongo_id" {
+				rawValue, exists = doc["mongo_id"]
+				if !exists {
+					if id, hasID := doc["_id"]; hasID {
+						switch v := id.(type) {
+						case primitive.ObjectID:
+							rawValue = v.Hex()
+							exists = true
+						default:
+							rawValue = fmt.Sprintf("%v", v)
+							exists = true
+						}
+					}
+				}
+			} else {
+				rawValue, exists = doc[colName]
+			}
+
 			if !exists || rawValue == nil {
 				values = append(values, nil) // Mapeia campo ausente ou nulo para NULL
 				continue
@@ -600,18 +649,12 @@ func migrateData(ctx context.Context, conn *pgx.Conn, tableName string, schema m
 
 			switch specificVal := rawValue.(type) {
 			case primitive.ObjectID:
-				if colName == "mongo_id" {
-					sqlValue = specificVal.Hex()
-				} else {
-					// ObjectID em outro campo? Tratar como texto.
-					sqlValue = specificVal.Hex()
-				}
+				sqlValue = specificVal.Hex()
 			case primitive.DateTime:
 				sqlValue = specificVal.Time()
 			case time.Time: // Já é time.Time
 				sqlValue = specificVal
 			case primitive.Decimal128:
-				// pgx pode lidar com Decimal128? Ou converter para string/float?
 				// Convertendo para string por segurança
 				sqlValue = specificVal.String()
 			case primitive.Binary:
@@ -623,12 +666,16 @@ func migrateData(ctx context.Context, conn *pgx.Conn, tableName string, schema m
 						log.Printf("Erro ao converter %s para JSON no doc %d: %v. Inserindo NULL.", colName, i, err)
 						sqlValue = nil
 					} else {
-						sqlValue = jsonBytes
+						sqlValue = string(jsonBytes) // Modificado: convertendo para string para JSONB
 					}
 				} else {
-					// Tipo inesperado para coluna não JSONB
-					log.Printf("Aviso: Tipo map/slice inesperado para coluna %s (tipo %s) no doc %d. Inserindo NULL.", colName, sqlType, i)
-					sqlValue = nil
+					log.Printf("Aviso: Tipo map/slice inesperado para coluna %s (tipo %s) no doc %d. Convertendo para JSONB.", colName, sqlType, i)
+					jsonBytes, err := json.Marshal(specificVal)
+					if err != nil {
+						sqlValue = nil
+					} else {
+						sqlValue = string(jsonBytes)
+					}
 				}
 			default:
 				sqlValue = specificVal // Tipos básicos (string, int, float, bool) devem funcionar
@@ -639,23 +686,50 @@ func migrateData(ctx context.Context, conn *pgx.Conn, tableName string, schema m
 		// Executar o INSERT
 		_, err := conn.Exec(ctx, insertSQL, values...)
 		if err != nil {
-			// Logar erro mas continuar tentando os próximos documentos?
-			log.Printf("ERRO ao inserir documento %d na tabela %s: %v\n  Valores: %v", i, tableName, err, values)
-			// Poderíamos retornar o erro aqui para parar a migração desta tabela
-			// return fmt.Errorf("erro ao inserir documento %d: %w", i, err)
+			errorCount++
+			log.Printf("ERRO ao inserir documento %d na tabela %s: %v", i, tableName, err)
+
+			// Mostrar os primeiros valores (limitado a 5) para debug
+			debugValues := "["
+			for j, v := range values {
+				if j < 5 {
+					if v == nil {
+						debugValues += "NULL, "
+					} else {
+						debugValues += fmt.Sprintf("%T(%v), ", v, v)
+					}
+				} else {
+					debugValues += "..."
+					break
+				}
+			}
+			debugValues += "]"
+			log.Printf("  Valores (parcial): %s", debugValues)
+
+			// Limitar o número de erros para não inundar o console
+			if errorCount >= 10 && errorCount == len(docs)/10 {
+				log.Printf("Muitos erros de inserção, reduzindo logging...")
+			} else if errorCount > 10 && errorCount != len(docs) {
+				// Não mostrar todos os erros
+				continue
+			}
 		} else {
 			insertedCount++
 		}
 
-		// Log de progresso (opcional, pode poluir muito)
-		if (i+1)%100 == 0 {
-			fmt.Printf("  ... %d / %d documentos inseridos em %s ...\n", i+1, len(docs), tableName)
+		// Log de progresso (opcional)
+		if insertedCount > 0 && insertedCount%1000 == 0 {
+			fmt.Printf("  ... %d / %d documentos inseridos em %s ...\n", insertedCount, len(docs), tableName)
 		}
 	}
+
 	fmt.Printf("  %d / %d documentos inseridos com sucesso em %s.\n", insertedCount, len(docs), tableName)
 	if insertedCount != len(docs) {
 		log.Printf("Aviso: %d erros ocorreram durante a inserção na tabela %s.", len(docs)-insertedCount, tableName)
+		if errorCount > 0 {
+			return fmt.Errorf("ocorreram %d erros durante a migração", errorCount)
+		}
 	}
 
-	return nil // Retorna nil mesmo se houver erros individuais (para continuar com outras tabelas)
+	return nil
 }
